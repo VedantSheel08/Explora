@@ -17,3 +17,5 @@ elif user_choice ==3 and index ==1:
     print(f'computer chose: {output[index-1]}, compuer wins')
 elif user_choice ==3 and index ==2:
     print(f'computer chose: {output[index-1]}, you wins')
+
+print ("hellow workddssdsds")
