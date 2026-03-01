@@ -1,1 +1,0 @@
-print("ishaan and kush is a good boy")

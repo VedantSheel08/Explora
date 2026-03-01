@@ -1,0 +1,349 @@
+// ====== EDIT THESE ======
+const NEARBY_RADIUS_METERS = 200; // "walk by" popup distance
+const VISIT_POINTS = 10;
+
+// Hardcoded sample businesses (replace with yours)
+// If you add placeId, Places API can fetch Google rating + limited reviews.
+const businesses = [
+  {
+    id: "b1",
+    name: "Cafe Nova",
+    category: "food",
+    lat: 43.6532,
+    lng: -79.3832,
+    placeId: null, // e.g. "ChIJN1t_tDeuEmsRUsoyG83frY4"
+  },
+  {
+    id: "b2",
+    name: "Retro Threads",
+    category: "retail",
+    lat: 43.6510,
+    lng: -79.3870,
+    placeId: null,
+  },
+  {
+    id: "b3",
+    name: "FixIt Services",
+    category: "services",
+    lat: 43.6560,
+    lng: -79.3795,
+    placeId: null,
+  },
+];
+
+let map;
+let userMarker = null;
+let userPos = null;
+let selectedBusiness = null;
+
+const markersById = new Map();
+
+// Local storage keys
+const LS_REVIEWS = "explora_reviews_v1";
+const LS_VISITS = "explora_visits_v1";
+const LS_POINTS = "explora_points_v1";
+
+function $(id) { return document.getElementById(id); }
+
+function showToast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.remove("hidden");
+  clearTimeout(showToast._timer);
+  showToast._timer = setTimeout(() => t.classList.add("hidden"), 3000);
+}
+
+function haversineMeters(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+function loadJSON(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
+  catch { return fallback; }
+}
+
+function saveJSON(key, val) {
+  localStorage.setItem(key, JSON.stringify(val));
+}
+
+function getPoints() {
+  return Number(localStorage.getItem(LS_POINTS) || 0);
+}
+function addPoints(n) {
+  localStorage.setItem(LS_POINTS, String(getPoints() + n));
+}
+
+function initMap() {
+  const defaultCenter = { lat: 43.6532, lng: -79.3832 };
+
+  map = new google.maps.Map($("map"), {
+    zoom: 14,
+    center: defaultCenter,
+    mapId: undefined, // optional
+  });
+
+  // Create markers from hardcoded businesses
+  renderMarkers();
+
+  // UI hooks
+  $("locBtn").addEventListener("click", () => useMyLocation());
+  $("categoryFilter").addEventListener("change", () => renderMarkers());
+
+  $("visitBtn").addEventListener("click", () => markVisited());
+  $("dirBtn").addEventListener("click", () => openDirections());
+  $("addReviewBtn").addEventListener("click", () => addExploraReview());
+
+  // Load a location once on startup (optional)
+  // useMyLocation();
+}
+
+function renderMarkers() {
+  // Remove existing markers
+  for (const m of markersById.values()) m.setMap(null);
+  markersById.clear();
+
+  const filter = $("categoryFilter").value;
+
+  businesses
+    .filter((b) => filter === "all" || b.category === filter)
+    .forEach((b) => {
+      const marker = new google.maps.Marker({
+        map,
+        position: { lat: b.lat, lng: b.lng },
+        title: b.name,
+      });
+
+      marker.addListener("click", () => selectBusiness(b));
+      markersById.set(b.id, marker);
+    });
+}
+
+function selectBusiness(b) {
+  selectedBusiness = b;
+
+  $("panelTitle").textContent = b.name;
+  $("panelMeta").textContent = `Category: ${b.category} • (${b.lat.toFixed(4)}, ${b.lng.toFixed(4)})`;
+
+  $("visitBtn").disabled = false;
+  $("dirBtn").disabled = !userPos; // only enable directions if we have user location
+  $("addReviewBtn").disabled = false;
+
+  renderExploraReviews(b.id);
+  renderGoogleReviewsPlaceholder();
+
+  // If business has placeId and Places library is loaded, fetch Google details/reviews
+  if (b.placeId && google?.maps?.places) {
+    fetchGooglePlaceDetails(b.placeId);
+  }
+}
+
+function useMyLocation() {
+  if (!navigator.geolocation) {
+    alert("Geolocation not supported in this browser.");
+    return;
+  }
+
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+
+      map.setCenter(userPos);
+
+      if (userMarker) userMarker.setMap(null);
+      userMarker = new google.maps.Marker({
+        map,
+        position: userPos,
+        title: "You",
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 8,
+          fillColor: "#4da3ff",
+          fillOpacity: 1,
+          strokeColor: "white",
+          strokeWeight: 2,
+        },
+      });
+
+      $("dirBtn").disabled = !selectedBusiness;
+
+      // "Pokemon Go" style nearby ping (checks all businesses once)
+      pingNearbyBusinesses();
+      showToast("Location set. Walk around to discover places nearby 👀");
+    },
+    () => alert("Location permission denied."),
+    { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
+  );
+}
+
+function pingNearbyBusinesses() {
+  if (!userPos) return;
+
+  // Find nearest within radius
+  let nearest = null;
+  let bestDist = Infinity;
+
+  for (const b of businesses) {
+    const d = haversineMeters(userPos, { lat: b.lat, lng: b.lng });
+    if (d < bestDist) { bestDist = d; nearest = b; }
+  }
+
+  if (nearest && bestDist <= NEARBY_RADIUS_METERS) {
+    showToast(`You're near ${nearest.name} (~${Math.round(bestDist)}m). Tap the pin for details!`);
+  }
+}
+
+function openDirections() {
+  if (!userPos || !selectedBusiness) return;
+
+  const to = { lat: selectedBusiness.lat, lng: selectedBusiness.lng };
+  const url =
+    `https://www.google.com/maps/dir/?api=1` +
+    `&origin=${userPos.lat},${userPos.lng}` +
+    `&destination=${to.lat},${to.lng}`;
+
+  window.open(url, "_blank");
+}
+
+function markVisited() {
+  if (!selectedBusiness) return;
+
+  // Optional anti-cheat: require user within radius to claim visit
+  if (userPos) {
+    const d = haversineMeters(userPos, { lat: selectedBusiness.lat, lng: selectedBusiness.lng });
+    if (d > NEARBY_RADIUS_METERS) {
+      showToast(`Too far to check in. Get within ${NEARBY_RADIUS_METERS}m (you are ~${Math.round(d)}m).`);
+      return;
+    }
+  }
+
+  const visits = loadJSON(LS_VISITS, {});
+  if (visits[selectedBusiness.id]) {
+    showToast("Already visited ✅");
+    return;
+  }
+
+  visits[selectedBusiness.id] = { at: Date.now() };
+  saveJSON(LS_VISITS, visits);
+
+  addPoints(VISIT_POINTS);
+  showToast(`Visited! +${VISIT_POINTS} points. Total: ${getPoints()}`);
+}
+
+function renderExploraReviews(businessId) {
+  const all = loadJSON(LS_REVIEWS, {});
+  const list = all[businessId] || [];
+
+  const root = $("exploraReviews");
+  root.innerHTML = "";
+
+  if (list.length === 0) {
+    root.innerHTML = `<div class="muted small">No reviews yet. Be the first!</div>`;
+    return;
+  }
+
+  for (const r of list.slice().reverse()) {
+    const div = document.createElement("div");
+    div.className = "review";
+    div.innerHTML = `
+      <div class="row">
+        <strong>${escapeHtml(r.name)}</strong>
+        <span class="stars">${"★".repeat(r.stars)}${"☆".repeat(5 - r.stars)}</span>
+      </div>
+      <p>${escapeHtml(r.text)}</p>
+      <div class="muted small">${new Date(r.at).toLocaleString()}</div>
+    `;
+    root.appendChild(div);
+  }
+}
+
+function addExploraReview() {
+  if (!selectedBusiness) return;
+
+  const name = $("reviewName").value.trim() || "Anonymous";
+  const stars = Number($("reviewStars").value);
+  const text = $("reviewText").value.trim();
+
+  if (!text) {
+    showToast("Write something first 🙂");
+    return;
+  }
+dont just 
+  const all = loadJSON(LS_REVIEWS, {});
+  all[selectedBusiness.id] = all[selectedBusiness.id] || [];
+  all[selectedBusiness.id].push({ name, stars, text, at: Date.now() });
+  saveJSON(LS_REVIEWS, all);
+
+  $("reviewText").value = "";
+  renderExploraReviews(selectedBusiness.id);
+  showToast("Review added ✅");
+}
+
+function renderGoogleReviewsPlaceholder() {
+  $("googleReviews").innerHTML =
+    `<div class="muted small">Add a <code>placeId</code> to this business to show Google rating + a few reviews.</div>`;
+}
+
+function fetchGooglePlaceDetails(placeId) {
+  const service = new google.maps.places.PlacesService(map);
+
+  service.getDetails(
+    {
+      placeId,
+      fields: ["name", "rating", "reviews", "formatted_address", "url"],
+    },
+    (place, status) => {
+      if (status !== google.maps.places.PlacesServiceStatus.OK || !place) {
+        $("googleReviews").innerHTML = `<div class="muted small">Could not load Google reviews (status: ${status}).</div>`;
+        return;
+      }
+
+      // Update panel meta with address + rating
+      const ratingText = place.rating ? `Google rating: ${place.rating}` : "No Google rating";
+      const addrText = place.formatted_address ? ` • ${place.formatted_address}` : "";
+      $("panelMeta").textContent = `${$("panelMeta").textContent} • ${ratingText}${addrText}`;
+
+      const reviews = place.reviews || [];
+      const root = $("googleReviews");
+      root.innerHTML = "";
+
+      if (reviews.length === 0) {
+        root.innerHTML = `<div class="muted small">No Google reviews returned.</div>`;
+        return;
+      }
+
+      for (const r of reviews) {
+        const div = document.createElement("div");
+        div.className = "review";
+        div.innerHTML = `
+          <div class="row">
+            <strong>${escapeHtml(r.author_name || "Google user")}</strong>
+            <span class="stars">${"★".repeat(r.rating || 0)}${"☆".repeat(5 - (r.rating || 0))}</span>
+          </div>
+          <p>${escapeHtml(r.text || "")}</p>
+        `;
+        root.appendChild(div);
+      }
+    }
+  );
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
